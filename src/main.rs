@@ -5,21 +5,28 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 use std::env;
+use std::io::Write;
 use std::thread;
 use winapi::ctypes::c_void;
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, TRUE};
+use winapi::shared::ntdef::NULL;
+use winapi::shared::winerror::ERROR_IO_PENDING;
 use winapi::shared::winerror::ERROR_PIPE_BUSY;
 use winapi::um::commapi::{SetCommState, SetCommTimeouts};
 use winapi::um::errhandlingapi::GetLastError;
-use winapi::um::fileapi::{CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING};
+use winapi::um::fileapi::{CreateFileW, ReadFile, WriteFile, OPEN_EXISTING};
 use winapi::um::handleapi::{CloseHandle, DuplicateHandle, INVALID_HANDLE_VALUE};
+use winapi::um::ioapiset::GetOverlappedResult;
+use winapi::um::minwinbase::OVERLAPPED;
 use winapi::um::namedpipeapi::{SetNamedPipeHandleState, WaitNamedPipeW};
 use winapi::um::processthreadsapi::GetCurrentProcess;
-use winapi::um::winbase::{CBR_115200, COMMTIMEOUTS, DCB, NOPARITY, ONESTOPBIT};
-use winapi::um::winbase::{PIPE_READMODE_BYTE, PIPE_WAIT};
-use winapi::um::winnt::{
-    DUPLICATE_SAME_ACCESS, FILE_ATTRIBUTE_NORMAL, GENERIC_READ, GENERIC_WRITE, HANDLE,
+use winapi::um::synchapi::CreateEventW;
+use winapi::um::winbase::{
+    CBR_115200, COMMTIMEOUTS, DCB, FILE_FLAG_OVERLAPPED, NOPARITY, ONESTOPBIT,
 };
+use winapi::um::winbase::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH};
+use winapi::um::winbase::{PIPE_READMODE_BYTE, PIPE_WAIT};
+use winapi::um::winnt::{DUPLICATE_SAME_ACCESS, GENERIC_READ, GENERIC_WRITE, HANDLE};
 
 enum WhichHandle {
     Pipe,
@@ -28,7 +35,9 @@ enum WhichHandle {
 
 pub struct Pipe2Serial {
     comdev: HANDLE,
+    comevent: HANDLE,
     pipedev: HANDLE,
+    pipeevent: HANDLE,
 }
 
 // Windows HANDLEs can be sent across threads
@@ -49,11 +58,16 @@ impl Pipe2Serial {
                 0,
                 ptr::null_mut(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
                 ptr::null_mut(),
             )
         };
         if comdev == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let comevent = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null_mut()) };
+        if comevent == NULL {
+            _ = unsafe { CloseHandle(comdev) };
             return Err(io::Error::last_os_error());
         }
         let mut dcb: DCB = unsafe { mem::zeroed() };
@@ -64,9 +78,9 @@ impl Pipe2Serial {
         dcb.StopBits = ONESTOPBIT;
         dcb.Parity = NOPARITY;
         if unsafe { SetCommState(comdev, &mut dcb) } == FALSE {
-            let error = io::Error::last_os_error();
             _ = unsafe { CloseHandle(comdev) };
-            return Err(error);
+            _ = unsafe { CloseHandle(comevent) };
+            return Err(io::Error::last_os_error());
         }
 
         // What on earth is this microsoft !? One needs to read the doc a dozen times
@@ -83,9 +97,9 @@ impl Pipe2Serial {
             WriteTotalTimeoutConstant: 0,
         };
         if unsafe { SetCommTimeouts(comdev, &mut timeouts) } == FALSE {
-            let error = io::Error::last_os_error();
             _ = unsafe { CloseHandle(comdev) };
-            return Err(error);
+            _ = unsafe { CloseHandle(comevent) };
+            return Err(io::Error::last_os_error());
         }
 
         let mut pipe_name_utf16 = Vec::<u16>::new();
@@ -101,7 +115,7 @@ impl Pipe2Serial {
                     0,
                     ptr::null_mut(),
                     OPEN_EXISTING,
-                    0,
+                    FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
                     ptr::null_mut(),
                 )
             };
@@ -123,25 +137,34 @@ impl Pipe2Serial {
         };
         if pipedev == INVALID_HANDLE_VALUE {
             _ = unsafe { CloseHandle(comdev) };
+            _ = unsafe { CloseHandle(comevent) };
+            return Err(io::Error::last_os_error());
+        }
+        let pipeevent = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null_mut()) };
+        if pipeevent == NULL {
+            _ = unsafe { CloseHandle(comdev) };
+            _ = unsafe { CloseHandle(comevent) };
+            _ = unsafe { CloseHandle(pipedev) };
             return Err(io::Error::last_os_error());
         }
         let mut dw_mode: DWORD = PIPE_READMODE_BYTE | PIPE_WAIT;
         let res = unsafe {
-            SetNamedPipeHandleState(
-                pipedev,         // pipe handle
-                &mut dw_mode,    // new pipe mode
-                ptr::null_mut(), // don't set maximum bytes
-                ptr::null_mut(),
-            )
+            SetNamedPipeHandleState(pipedev, &mut dw_mode, ptr::null_mut(), ptr::null_mut())
         };
         if res == FALSE {
-            let error = io::Error::last_os_error();
             _ = unsafe { CloseHandle(comdev) };
+            _ = unsafe { CloseHandle(comevent) };
             _ = unsafe { CloseHandle(pipedev) };
-            return Err(error);
+            _ = unsafe { CloseHandle(pipeevent) };
+            return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { comdev, pipedev })
+        Ok(Self {
+            comdev,
+            comevent,
+            pipedev,
+            pipeevent,
+        })
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -158,10 +181,13 @@ impl Pipe2Serial {
                 DUPLICATE_SAME_ACCESS,
             )
         };
-
         if res == FALSE {
-            let error = io::Error::last_os_error();
-            return Err(error);
+            return Err(io::Error::last_os_error());
+        }
+        let comevent = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null_mut()) };
+        if comevent == NULL {
+            _ = unsafe { CloseHandle(comdev) };
+            return Err(io::Error::last_os_error());
         }
 
         let mut pipedev = INVALID_HANDLE_VALUE;
@@ -177,78 +203,101 @@ impl Pipe2Serial {
                 DUPLICATE_SAME_ACCESS,
             )
         };
-
         if res == FALSE {
-            let error = io::Error::last_os_error();
             _ = unsafe { CloseHandle(comdev) };
-            return Err(error);
+            _ = unsafe { CloseHandle(comevent) };
+            return Err(io::Error::last_os_error());
+        }
+        let pipeevent = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null_mut()) };
+        if pipeevent == NULL {
+            _ = unsafe { CloseHandle(comdev) };
+            _ = unsafe { CloseHandle(comevent) };
+            _ = unsafe { CloseHandle(pipedev) };
+            return Err(io::Error::last_os_error());
         }
 
-        Ok(Self { comdev, pipedev })
+        Ok(Self {
+            comdev,
+            comevent,
+            pipedev,
+            pipeevent,
+        })
     }
 
     fn read(&mut self, which: WhichHandle, buf: &mut [u8]) -> io::Result<usize> {
-        let handle = match which {
-            WhichHandle::Pipe => self.pipedev,
-            WhichHandle::Serial => self.comdev,
+        let (handle, event) = match which {
+            WhichHandle::Pipe => (self.pipedev, self.pipeevent),
+            WhichHandle::Serial => (self.comdev, self.comevent),
         };
-        let mut bytes_read: DWORD = 0;
-        let res = unsafe {
+        let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
+        overlapped.hEvent = event;
+        let res: BOOL = unsafe {
             ReadFile(
                 handle,
                 buf.as_mut_ptr() as *mut c_void,
                 buf.len() as DWORD,
-                &mut bytes_read,
                 ptr::null_mut(),
+                &mut overlapped,
             )
         };
+        // async read request may succeed immediately, queue successfully, or fail.
+        // even if it returns TRUE, the number of bytes read should be retrieved via
+        // GetOverlappedResult().
+        if res == FALSE && unsafe { GetLastError() } != ERROR_IO_PENDING {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len: DWORD = 0;
+        let res: BOOL =
+            unsafe { GetOverlappedResult(self.comdev, &mut overlapped, &mut len, TRUE) };
         if res == FALSE {
             return Err(io::Error::last_os_error());
         }
-
-        Ok(bytes_read as usize)
+        match len {
+            0 if buf.len() == 0 => Ok(0),
+            0 => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ReadFile() timed out (0 bytes read)",
+            )),
+            _ => Ok(len as usize),
+        }
     }
 
     fn write(&mut self, which: WhichHandle, buf: &[u8]) -> io::Result<usize> {
-        let handle = match which {
-            WhichHandle::Pipe => self.pipedev,
-            WhichHandle::Serial => self.comdev,
+        let (handle, event) = match which {
+            WhichHandle::Pipe => (self.pipedev, self.pipeevent),
+            WhichHandle::Serial => (self.comdev, self.comevent),
         };
-        let mut bytes_written: DWORD = 0;
+        let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
+        overlapped.hEvent = event;
         let res: BOOL = unsafe {
             WriteFile(
                 handle,
                 buf.as_ptr() as *const c_void,
                 buf.len() as DWORD,
-                &mut bytes_written,
                 ptr::null_mut(),
+                &mut overlapped,
             )
         };
-
+        // async write request may succeed immediately, queue successfully, or fail.
+        // even if it returns TRUE, the number of bytes written should be retrieved
+        // via GetOverlappedResult().
+        if res == FALSE && unsafe { GetLastError() } != ERROR_IO_PENDING {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len: DWORD = 0;
+        let res: BOOL =
+            unsafe { GetOverlappedResult(self.comdev, &mut overlapped, &mut len, TRUE) };
         if res == FALSE {
             return Err(io::Error::last_os_error());
         }
-
-        Ok(bytes_written as usize)
-    }
-
-    #[allow(dead_code)]
-    fn flush_pipe(&mut self) -> io::Result<()> {
-        let err = unsafe { FlushFileBuffers(self.pipedev) };
-        if err == 0 {
-            println!("FLUSH FAILED");
-            return Err(io::Error::last_os_error());
+        match len {
+            0 if buf.len() == 0 => Ok(0),
+            0 => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "WriteFile() timed out (0 bytes written)",
+            )),
+            _ => Ok(len as usize),
         }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn flush_serial(&mut self) -> io::Result<()> {
-        let err = unsafe { FlushFileBuffers(self.comdev) };
-        if err == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 }
 
@@ -266,20 +315,19 @@ fn main() {
         return;
     }
 
-    println!("Opening first set");
     let mut p2s = Pipe2Serial::open(&args[1], &args[2]).expect("Opening COM/pipe failed");
-    println!("opening second set");
     let mut p2s_clone = p2s.try_clone().expect("Cloning COM/pipe failed");
-    println!("spawning");
 
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             let res = p2s.read(WhichHandle::Serial, &mut buf);
-            println!("DONE READ {res:?}");
             match res {
                 Ok(res) => {
-                    print!("{}", std::str::from_utf8(&buf[0..res]).unwrap());
+                    if let Ok(buf_str) = std::str::from_utf8(&buf[0..res]) {
+                        print!("{}", buf_str);
+                        io::stdout().flush().ok();
+                    }
                     let mut written = 0;
                     loop {
                         if written == res {
@@ -288,8 +336,6 @@ fn main() {
                         match p2s.write(WhichHandle::Pipe, &buf[written..res]) {
                             Ok(wrote) => {
                                 written += wrote;
-                                println!("wrote to pipe {wrote:}");
-                                p2s.flush_pipe().ok();
                             }
                             Err(err) => println!("Error writing to pipe {err:}"),
                         }
@@ -303,12 +349,25 @@ fn main() {
     let mut buf = [0u8; 4096];
     loop {
         match p2s_clone.read(WhichHandle::Pipe, &mut buf) {
-            Ok(res) => match p2s_clone.write(WhichHandle::Serial, &buf[0..res]) {
-                Ok(_) => {}
-                Err(err) => println!("Error writing to serial {err:}"),
-            },
+            Ok(res) => {
+                if let Ok(buf_str) = std::str::from_utf8(&buf[0..res]) {
+                    print!("{}", buf_str);
+                    io::stdout().flush().ok();
+                }
+                let mut written = 0;
+                loop {
+                    if written == res {
+                        break;
+                    }
+                    match p2s_clone.write(WhichHandle::Serial, &buf[written..res]) {
+                        Ok(wrote) => {
+                            written += wrote;
+                        }
+                        Err(err) => println!("Error writing to pipe {err:}"),
+                    }
+                }
+            }
             Err(err) => println!("Error reading from pipe {err:}"),
         }
-        //std::thread::sleep(std::time::Duration::from_secs(100));
     }
 }
