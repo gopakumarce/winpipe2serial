@@ -4,7 +4,7 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
-use std::env;
+use clap::Parser;
 use std::io::Write;
 use std::thread;
 use winapi::ctypes::c_void;
@@ -28,6 +28,37 @@ use winapi::um::winbase::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH};
 use winapi::um::winbase::{PIPE_READMODE_BYTE, PIPE_WAIT};
 use winapi::um::winnt::{DUPLICATE_SAME_ACCESS, GENERIC_READ, GENERIC_WRITE, HANDLE};
 
+#[derive(Parser, Debug)]
+struct Args {
+    /// COM port name. Example --com COM1
+    #[arg(short, long)]
+    com: String,
+
+    /// pipe name. If the pipe is \\.\pipe\PipeDream, give --pipe PipeDream
+    #[arg(short, long)]
+    pipe: String,
+
+    /// Baud rate. Example --speed 9600
+    #[arg(short, long, default_value_t = CBR_115200)]
+    speed: u32,
+
+    /// Byte size
+    #[arg(short, long, default_value_t = 8)]
+    bytes: u8,
+
+    /// Stop bits
+    #[arg(short = 't', long, default_value_t = ONESTOPBIT)]
+    stop: u8,
+
+    /// Parity
+    #[arg(short = 'i', long, default_value_t = NOPARITY)]
+    parity: u8,
+
+    /// Verbose will print messages to and from the COM port
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+}
+
 enum WhichHandle {
     Pipe,
     Serial,
@@ -45,10 +76,10 @@ unsafe impl Send for Pipe2Serial {}
 unsafe impl Sync for Pipe2Serial {}
 
 impl Pipe2Serial {
-    pub fn open(port_name: &str, pipe_name: &str) -> io::Result<Self> {
+    fn open(args: &Args) -> io::Result<Self> {
         let mut port_name_utf16 = Vec::<u16>::new();
         port_name_utf16.extend(OsStr::new("\\\\.\\").encode_wide());
-        port_name_utf16.extend(OsStr::new(port_name).encode_wide());
+        port_name_utf16.extend(OsStr::new(&args.com).encode_wide());
         port_name_utf16.push(0);
 
         let comdev = unsafe {
@@ -73,10 +104,10 @@ impl Pipe2Serial {
         let mut dcb: DCB = unsafe { mem::zeroed() };
         dcb.DCBlength = mem::size_of::<DCB>() as u32;
         dcb.set_fBinary(TRUE as u32);
-        dcb.BaudRate = CBR_115200;
-        dcb.ByteSize = 8;
-        dcb.StopBits = ONESTOPBIT;
-        dcb.Parity = NOPARITY;
+        dcb.BaudRate = args.speed;
+        dcb.ByteSize = args.bytes;
+        dcb.StopBits = args.stop;
+        dcb.Parity = args.parity;
         if unsafe { SetCommState(comdev, &mut dcb) } == FALSE {
             _ = unsafe { CloseHandle(comdev) };
             _ = unsafe { CloseHandle(comevent) };
@@ -104,7 +135,7 @@ impl Pipe2Serial {
 
         let mut pipe_name_utf16 = Vec::<u16>::new();
         pipe_name_utf16.extend(OsStr::new("\\\\.\\pipe\\").encode_wide());
-        pipe_name_utf16.extend(OsStr::new(pipe_name).encode_wide());
+        pipe_name_utf16.extend(OsStr::new(&args.pipe).encode_wide());
         pipe_name_utf16.push(0);
 
         let pipedev = loop {
@@ -167,7 +198,7 @@ impl Pipe2Serial {
         })
     }
 
-    pub fn try_clone(&self) -> io::Result<Self> {
+    fn try_clone(&self) -> io::Result<Self> {
         let mut comdev = INVALID_HANDLE_VALUE;
         let process = unsafe { GetCurrentProcess() };
         let res = unsafe {
@@ -309,13 +340,9 @@ impl Drop for Pipe2Serial {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        println!("Usage: {} COMn pipe-name", args[0]);
-        return;
-    }
-
-    let mut p2s = Pipe2Serial::open(&args[1], &args[2]).expect("Opening COM/pipe failed");
+    let args = Args::parse();
+    let verbose = args.verbose;
+    let mut p2s = Pipe2Serial::open(&args).expect("Opening COM/pipe failed");
     let mut p2s_clone = p2s.try_clone().expect("Cloning COM/pipe failed");
 
     thread::spawn(move || {
@@ -324,9 +351,11 @@ fn main() {
             let res = p2s.read(WhichHandle::Serial, &mut buf);
             match res {
                 Ok(res) => {
-                    if let Ok(buf_str) = std::str::from_utf8(&buf[0..res]) {
-                        print!("{}", buf_str);
-                        io::stdout().flush().ok();
+                    if verbose {
+                        if let Ok(buf_str) = std::str::from_utf8(&buf[0..res]) {
+                            print!("{}", buf_str);
+                            io::stdout().flush().ok();
+                        }
                     }
                     let mut written = 0;
                     loop {
@@ -350,9 +379,11 @@ fn main() {
     loop {
         match p2s_clone.read(WhichHandle::Pipe, &mut buf) {
             Ok(res) => {
-                if let Ok(buf_str) = std::str::from_utf8(&buf[0..res]) {
-                    print!("{}", buf_str);
-                    io::stdout().flush().ok();
+                if verbose {
+                    if let Ok(buf_str) = std::str::from_utf8(&buf[0..res]) {
+                        print!("{}", buf_str);
+                        io::stdout().flush().ok();
+                    }
                 }
                 let mut written = 0;
                 loop {
