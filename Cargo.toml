@@ -16,4 +16,4 @@ license = "MIT"
 
 [dependencies]
 clap = {version = "4.2.4", features = ["derive"]}
-winapi = { features = ["std", "commapi", "errhandlingapi", "fileapi", "namedpipeapi", "handleapi", "ioapiset", "synchapi", "winbase", "winerror", "winnt"] }
+winapi = {version = "0.3.9", features = ["std", "commapi", "errhandlingapi", "fileapi", "namedpipeapi", "handleapi", "ioapiset", "synchapi", "winbase", "winerror", "winnt"] }
