@@ -7,7 +7,7 @@ description = "Utility to link a windows named pipe to a serial COM port"
 homepage = "https://github.com/gopakumarce/winpipe2serial.git"
 repository = "https://github.com/gopakumarce/winpipe2serial.git"
 readme = "README.md"
-keywords = ["named pipe", "windows", "serial", "COM port"]
+keywords = ["named-pipe", "windows", "serial", "COM port"]
 categories = ["embedded", "serial"]
 license = "MIT"
 
